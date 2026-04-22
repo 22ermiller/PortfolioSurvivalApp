@@ -36,19 +36,16 @@ get_last_quarterly_cpi_val <- function(cpi_df) {
 
 eci_single_sim <- function(model, sim_length, cpi_sim, final_cpi_value) {
   # make cpi simulation quarterly
-  quarterly_cpi_sim_df <- data.frame(
+  yearly_cpi_sim_df <- data.frame(
     date = zoo::as.Date(time(cpi_sim)),
     value = cpi_sim
   ) |>
-    mutate(year = year(date), quarter = quarter(date)) |>
-    group_by(year, quarter) |>
+    mutate(year = year(date)) |>
+    group_by(year) |>
     summarize(date = max(date), log_dif_cpi = sum(value))
 
-  lagged_cpi_sim <- c(
-    final_cpi_value,
-    head(quarterly_cpi_sim_df$log_dif_cpi, n = -1)
-  )
-  sim <- simulate(model, nsim = sim_length, xreg = lagged_cpi_sim)
+  yearly_cpi_sim <- yearly_cpi_sim_df$log_dif_cpi[1:sim_length]
+  sim <- simulate(model, nsim = sim_length, xreg = yearly_cpi_sim)
 
   return(sim)
 }
@@ -317,41 +314,89 @@ get_yield_df <- function(yield_curve) {
 }
 
 
-# Vectorized interpolation using base R
-interpolate_rates_vec <- function(curve_df, target_months) {
-  # Convert to years
-  target_time <- target_months / 12
+interpolate_rate <- function(curve_df, target_month) {
+  target_time <- target_month / 12
 
-  # Ensure sorted once
-  curve_df <- curve_df[order(curve_df$time), ]
+  # Ensure sorted by maturity
+  curve_df <- curve_df %>% arrange(time)
 
-  # Use approx for linear interpolation with constant extrapolation
-  approx(x = curve_df$time, y = curve_df$rate, xout = target_time, rule = 2)$y
+  # If exactly matches a maturity, return directly
+  if (target_time %in% curve_df$time) {
+    return(curve_df$rate[curve_df$time == target_time])
+  } else if (target_time < min(curve_df$time)) {
+    # if target time is below minimum time, return minimum time rate
+    return(curve_df$rate[curve_df$time == min(curve_df$time)])
+  } else if (target_time > max(curve_df$time)) {
+    # if target time is above maximum time, return maximum time rate
+    return(curve_df$rate[curve_df$time == max(curve_df$time)])
+  }
+
+  lower <- max(curve_df$time[curve_df$time < target_time])
+  upper <- min(curve_df$time[curve_df$time > target_time])
+
+  rate_lower <- curve_df$rate[curve_df$time == lower]
+  rate_upper <- curve_df$rate[curve_df$time == upper]
+
+  slope <- (rate_upper - rate_lower) / (upper - lower)
+  interpolated <- rate_lower + slope * (target_time - lower)
+
+  return(interpolated)
 }
 
-price_annuity <- function(start_age, yield_curve, mortality_tbl, payout, load) {
-  # Prepare yield curve once
-  yield_curve_df <- get_yield_df(yield_curve[1, ])
+interpolate_rates <- function(curve_df, target_months) {
+  # assume curve_df is already sorted
+  target_time <- target_months / 12
+
+  approx(
+    x = curve_df$time,
+    y = curve_df$rate,
+    xout = target_time,
+    rule = 2 # clamp to endpoints
+  )$y
+}
+
+
+price_annuity <- function(
+  start_age,
+  yield_curve,
+  mortality_tbl,
+  purchase_date,
+  payout,
+  load
+) {
+  # get yield_curve_df
+  yield_curve_df <- get_yield_df(yield_curve[purchase_date, ])
   yield_curve_df <- yield_curve_df[order(yield_curve_df$time), ]
 
-  # Mortality clipping
-  if (start_age * 12 < min(mortality_tbl$month) - 1) {
+  # set mortality for starting age
+  if (start_age * 12 >= min(mortality_tbl$month) - 1) {
+    mortality_tbl_clipped <- mortality_tbl %>%
+      filter(month >= start_age * 12)
+  } else {
     stop("start_age must be at least 50")
   }
-  mortality_tbl_clipped <- mortality_tbl[
-    mortality_tbl$month >= start_age * 12,
-  ]
 
-  months_seq <- seq_len(nrow(mortality_tbl_clipped))
+  # define length (from mortality table probabilities)
+  length <- nrow(mortality_tbl_clipped)
 
-  # Vectorized interpolation
-  rates <- interpolate_rates_vec(yield_curve_df, months_seq)
+  # create a sequence of months from 1-length
+  months_seq <- seq(1, length)
 
-  # Compute discount and EPV in base R
-  discounts <- (1 + rates)^(-months_seq / 12)
-  epv <- discounts * mortality_tbl_clipped$S
+  # put month sequence in rate interpolation function
+  interpolated_rates <- interpolate_rates(yield_curve_df, months_seq)
 
-  price <- sum(epv) * payout * (1 + load)
+  pricing_df <- data.frame(month = months_seq, rate = interpolated_rates) %>%
+    mutate(
+      discount = (1 + rate)^(-month / 12),
+      survival_prob = mortality_tbl_clipped$S,
+      epv = discount * survival_prob
+    )
+
+  # calculate price
+  total_epv <- sum(pricing_df$epv) * payout
+  load <- .1
+  price <- total_epv * (1 + load)
+
   return(price)
 }
 
@@ -359,19 +404,23 @@ price_annuities <- function(
   start_age,
   yield_curves,
   mortality_tbl,
+  purchase_date,
   payout,
   load,
   n_sims
 ) {
-  prices <- numeric(n_sims)
-  for (i in seq_len(n_sims)) {
+  prices <- vector("numeric", n_sims)
+
+  for (i in 1:n_sims) {
     prices[i] <- price_annuity(
       start_age,
       yield_curves[[i]],
       mortality_tbl,
+      purchase_date,
       payout,
       load
     )
   }
+
   return(prices)
 }

@@ -22,7 +22,7 @@ equity_mean_mod_resids <- readRDS("data/models/mean_mod_resids.rds")
 # Read in functions
 source("data/functions.R")
 
-n_years <- 50
+n_years <- 80
 n_sims <- 1000
 
 # Load in Necessary Data --------------------------------------------------
@@ -53,20 +53,107 @@ full_ir_df <- read_csv("data/data/full_ir.csv") |>
 mortality_tbl <- read_csv("data/data/mortality.csv") |>
   filter(!is.na(death_pdf))
 
+
+# Set up duckdb database -------------------------------------------------
+
+library(duckdb)
+
+con <- dbConnect(duckdb(), dbdir = "esg-db.duckdb", read_only = FALSE)
+
 # Simulations -------------------------------------------------------------
 
+## CPI ##
 cpi_sims <- cpi_multiple_sims(cpi_mod, n_years * 12, n_sims)
+cpi_sims_df <- as_tibble(do.call(rbind, cpi_sims))
+cpi_long <- cpi_sims_df %>%
+  mutate(sim_id = row_number()) %>%
+  pivot_longer(
+    cols = -sim_id,
+    names_to = "month",
+    values_to = "log_cpi"
+  ) %>%
+  mutate(
+    month = as.integer(gsub("[^0-9]", "", month))
+  ) %>%
+  group_by(sim_id) %>%
+  arrange(month) %>%
+  mutate(price_level = cumprod(exp(log_cpi))) %>%
+  ungroup()
 
+# create cpi table
+dbWriteTable(con, "cpi_sims", cpi_long, overwrite = TRUE)
+
+## ECI ##
 final_cpi_val <- get_last_quarterly_cpi_val(cpi_df)
 eci_sims <- eci_multiple_sims(
   eci_mod,
-  n_years * 4,
+  n_years,
   n_sims,
   cpi_sims,
   final_cpi_val
 )
+matrix_eci_sims <- do.call(rbind, eci_sims)
+matrix_eci_sims <- t(apply(matrix_eci_sims, 1, function(x) cumprod(exp(x))))
+matrix_eci_sims <- t(apply(matrix_eci_sims, 1, function(x) {
+  n_years <- length(x)
+  monthly <- numeric(n_years * 12)
+
+  for (i in 1:(n_years - 1)) {
+    # endpoints for this year
+    y0 <- x[i]
+    y1 <- x[i + 1]
+
+    # 12 monthly points (including first month = y0)
+    monthly_segment <- seq(y0, y1, length.out = 12)
+
+    # fill into output
+    monthly[((i - 1) * 12 + 1):(i * 12)] <- monthly_segment
+  }
+
+  # last year gets flat because no next point
+  monthly[(n_years - 1) * 12 + 1] <- x[n_years]
+  monthly[(n_years - 1) * 12 + 2:(12)] <- x[n_years]
+
+  monthly
+}))
+
+eci_long <- as_tibble(matrix_eci_sims) %>%
+  mutate(sim_id = row_number()) %>%
+  pivot_longer(
+    cols = -sim_id,
+    names_to = "month",
+    values_to = "wage_level"
+  ) %>%
+  mutate(
+    month = as.integer(gsub("[^0-9]", "", month))
+  )
+
+# create eci table
+dbWriteTable(con, "eci_sims", eci_long, overwrite = TRUE)
+
+## MED CPI ##
 
 med_sims <- med_multiple_sims(med_mod, n_years * 12, n_sims)
+med_sims_df <- as_tibble(do.call(rbind, med_sims))
+med_cpi_long <- med_sims_df %>%
+  mutate(sim_id = row_number()) %>%
+  pivot_longer(
+    cols = -sim_id,
+    names_to = "month",
+    values_to = "log_mcpi"
+  ) %>%
+  mutate(
+    month = as.integer(gsub("[^0-9]", "", month))
+  ) %>%
+  group_by(sim_id) %>%
+  arrange(month) %>%
+  mutate(med_price_level = cumprod(exp(log_mcpi))) %>%
+  ungroup()
+
+# create med_cpi table
+dbWriteTable(con, "med_cpi_sims", med_cpi_long, overwrite = TRUE)
+
+## 3MO INTEREST RATE ##
 
 mean_3mo_ir <- get_average_3mo_rate(ir3mo_df)
 ir3mo_sims <- ir3mo_multiple_sims(
@@ -76,6 +163,8 @@ ir3mo_sims <- ir3mo_multiple_sims(
   cpi_sims,
   mean_3mo_ir
 )
+
+saveRDS(ir3mo_sims, "imports/ir3mo_sims.rds")
 
 slope_curve_vals <- get_final_slope_curve_vals(full_ir_df)
 yield_curve_sims <- yield_multiple_sims(
@@ -87,6 +176,20 @@ yield_curve_sims <- yield_multiple_sims(
   slope_curve_vals
 )
 
+# add simulation and month indeces
+for (i in 1:length(yield_curve_sims)) {
+  yield_curve_sims[[i]]$sim_id <- i
+  yield_curve_sims[[i]]$month <- seq(1:nrow(yield_curve_sims[[i]]))
+}
+
+ir_df <- as_tibble(do.call(rbind, yield_curve_sims)) %>%
+  select(sim_id, month, everything())
+
+
+# create interest rate table
+dbWriteTable(con, "interest_rate_sims", ir_df, overwrite = TRUE)
+
+
 equity_rs_mod <- fit_equity_rs_model(equity_mean_mod_resids)
 equity_sims <- equity_multiple_sims(
   equity_mean_mod,
@@ -97,10 +200,73 @@ equity_sims <- equity_multiple_sims(
   ir3mo_sims
 )
 
-annuity_prices <- price_annuities_fast(
-  start_age = 60,
+equity_long <- as_tibble(equity_sims) %>%
+  mutate(sim_id = row_number()) %>%
+  pivot_longer(
+    cols = -sim_id,
+    names_to = "month",
+    values_to = "log_returns"
+  ) %>%
+  mutate(
+    month = as.integer(gsub("[^0-9]", "", month))
+  ) %>%
+  mutate(equity_gross = exp(log_returns))
+
+
+# create equity_returns table
+dbWriteTable(con, "equity_sims", equity_long, overwrite = TRUE)
+
+annuity_df <- crossing(
+  purchase_age = seq(60, 100),
+  months_into_future = seq(1, 80 * 12, by = 12)
+)
+
+handlers(global = TRUE)
+handlers("txtprogressbar")
+
+
+with_progress({
+  p <- progressor(along = seq_len(nrow(annuity_df)))
+
+  annuity_df <- annuity_df %>%
+    mutate(
+      annuity_prices = pmap(
+        list(purchase_age, months_into_future),
+        function(purchase_age, months_into_future) {
+          p()
+          price_annuities(
+            start_age = purchase_age,
+            yield_curve_sims,
+            mortality_tbl,
+            purchase_date = months_into_future,
+            payout = 1,
+            load = .1,
+            n_sims
+          )
+        }
+      )
+    )
+})
+
+annuity_long <- annuity_df %>%
+  unnest_longer(annuity_prices, indices_to = "sim_id") %>%
+  select(
+    sim_id,
+    purchase_age,
+    months_into_future,
+    annuity_price = annuity_prices
+  )
+
+# create annuity_prices table
+dbWriteTable(con, "annuity_prices", annuity_long, overwrite = TRUE)
+
+dbDisconnect(con)
+
+annuity_prices <- price_annuities(
+  start_age = 90,
   yield_curve_sims,
   mortality_tbl,
+  1,
   1,
   .1,
   n_sims
